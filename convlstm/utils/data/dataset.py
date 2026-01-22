@@ -261,10 +261,6 @@ class SequenceDataset(Dataset):
         return stats
 
 
-# 向后兼容别名
-FireSequenceDataset = SequenceDataset
-
-
 def build_dataloader(
         data_root: str,
         seq_length: int = 5,

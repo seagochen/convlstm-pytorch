@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FireConvLSTM 训练脚本
+TemporalClassifier 训练脚本
 
 Usage:
     python train.py --data_root /path/to/data --epochs 10
@@ -18,7 +18,7 @@ from pathlib import Path
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from convlstm import FireConvLSTM, Trainer, build_dataloader, ClassConfig
+from convlstm import TemporalClassifier, Trainer, build_dataloader, ClassConfig
 
 
 def increment_path(path: Path, exist_ok: bool = False, sep: str = '_') -> Path:
@@ -55,7 +55,7 @@ def increment_path(path: Path, exist_ok: bool = False, sep: str = '_') -> Path:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train FireConvLSTM for fire detection')
+    parser = argparse.ArgumentParser(description='Train TemporalClassifier for temporal detection')
 
     # 数据参数
     parser.add_argument('--data_root', type=str, default=None,
@@ -192,7 +192,7 @@ def main():
 
     # 创建模型
     print("\n创建模型...")
-    model = FireConvLSTM(num_classes=num_classes)
+    model = TemporalClassifier(num_classes=num_classes)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

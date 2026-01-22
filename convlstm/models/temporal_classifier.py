@@ -100,10 +100,6 @@ class TemporalClassifier(nn.Module):
             # output: (B, num_classes, 20, 20), 每个位置的通道和为 1
 
 
-# 保持向后兼容
-FireConvLSTM = TemporalClassifier
-
-
 def create_model(checkpoint_path: str = None, num_classes: int = 3):
     """
     创建 TemporalClassifier 模型
