@@ -19,8 +19,11 @@ When both fire and smoke are detected:
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Literal
 from ultralytics import YOLO
+
+# Detection mode type
+DetectMode = Literal['all', 'fire', 'smoke']
 
 from core import (
     CLASS_NAMES,
@@ -106,7 +109,8 @@ def analyze_video_for_smoke_bbox(
     model: YOLO,
     conf_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
     sample_rate: int = 5,
-    padding_ratio: float = BBOX_PADDING_RATIO
+    padding_ratio: float = BBOX_PADDING_RATIO,
+    detect_mode: DetectMode = 'all'
 ) -> Tuple[Optional[Tuple[int, int, int, int]], Dict]:
     """
     Analyze video to compute stable union bbox for smoke detections.
@@ -117,10 +121,31 @@ def analyze_video_for_smoke_bbox(
         conf_threshold: Confidence threshold
         sample_rate: Process every Nth frame
         padding_ratio: Padding around union bbox
+        detect_mode: Detection mode ('all', 'fire', 'smoke')
 
     Returns:
         Tuple of (union_bbox, stats_dict)
     """
+    # Skip analysis if only detecting fire (no smoke bbox needed)
+    if detect_mode == 'fire':
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open video: {video_path}")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        print(f"Detection mode: fire only (skipping smoke bbox analysis)")
+        return None, {
+            'total_frames': total_frames,
+            'sampled_frames': 0,
+            'frames_with_fire': 0,
+            'frames_with_smoke': 0,
+            'smoke_bboxes_count': 0,
+            'smoke_union_bbox': None,
+            'fps': fps,
+            'detect_mode': detect_mode
+        }
+
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {video_path}")
@@ -128,7 +153,8 @@ def analyze_video_for_smoke_bbox(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
 
-    print(f"Analyzing video for smoke bbox union...")
+    mode_str = "smoke only" if detect_mode == 'smoke' else "fire + smoke"
+    print(f"Analyzing video for smoke bbox union... (mode: {mode_str})")
     print(f"Total frames: {total_frames}, FPS: {fps:.2f}")
     print(f"Sample rate: every {sample_rate} frame(s)")
 
@@ -193,7 +219,8 @@ def analyze_video_for_smoke_bbox(
         'frames_with_smoke': frames_with_smoke,
         'smoke_bboxes_count': len(all_smoke_bboxes),
         'smoke_union_bbox': smoke_union_bbox,
-        'fps': fps
+        'fps': fps,
+        'detect_mode': detect_mode
     }
 
     return smoke_union_bbox, stats
@@ -205,7 +232,8 @@ def preprocess_frame(
     smoke_union_bbox: Optional[Tuple[int, int, int, int]],
     mask_ema: Optional[MaskEMA],
     conf_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
-    augment_params: Optional[AugmentationParameters] = None
+    augment_params: Optional[AugmentationParameters] = None,
+    detect_mode: DetectMode = 'all'
 ) -> Tuple[np.ndarray, Dict]:
     """
     Preprocess a single frame for LSTM training.
@@ -221,6 +249,8 @@ def preprocess_frame(
         smoke_union_bbox: Pre-computed union bbox for smoke (None if no smoke in video)
         mask_ema: MaskEMA instance for fire mask smoothing
         conf_threshold: Confidence threshold
+        augment_params: Optional augmentation parameters
+        detect_mode: Detection mode ('all', 'fire', 'smoke')
 
     Returns:
         Tuple of (preprocessed_frame, info_dict)
@@ -231,14 +261,21 @@ def preprocess_frame(
     results = model(resized_frame, conf=conf_threshold, verbose=False)[0]
     detections = extract_detections_from_yolo(results, (h, w), TARGET_CLASSES, conf_threshold)
 
-    # Separate fire and smoke detections
-    fire_dets = [d for d in detections if d.class_id in SEGMENT_CLASSES]
-    smoke_dets = [d for d in detections if d.class_id in BBOX_CLASSES]
+    # Separate fire and smoke detections based on detect_mode
+    if detect_mode == 'fire':
+        fire_dets = [d for d in detections if d.class_id in SEGMENT_CLASSES]
+        smoke_dets = []
+    elif detect_mode == 'smoke':
+        fire_dets = []
+        smoke_dets = [d for d in detections if d.class_id in BBOX_CLASSES]
+    else:  # 'all'
+        fire_dets = [d for d in detections if d.class_id in SEGMENT_CLASSES]
+        smoke_dets = [d for d in detections if d.class_id in BBOX_CLASSES]
 
-    # Build detection info
+    # Build detection info (only for target classes based on detect_mode)
     det_info = [
         {'class_id': d.class_id, 'class_name': CLASS_NAMES[d.class_id], 'confidence': d.confidence}
-        for d in detections
+        for d in (fire_dets + smoke_dets)
     ]
 
     # Initialize combined mask
@@ -300,7 +337,8 @@ def preprocess_video_for_lstm(
     use_ema: bool = True,
     ema_alpha: float = EMA_ALPHA,
     augment: bool = False,
-    augment_seed: Optional[int] = None
+    augment_seed: Optional[int] = None,
+    detect_mode: DetectMode = 'all'
 ):
     """
     Generator that yields preprocessed frames from a video.
@@ -315,15 +353,18 @@ def preprocess_video_for_lstm(
         ema_alpha: EMA smoothing factor
         augment: Apply data augmentation to output frames
         augment_seed: Random seed for reproducible augmentation
+        detect_mode: Detection mode ('all', 'fire', 'smoke')
 
     Yields:
         Tuple of (frame_idx, preprocessed_frame, info_dict)
     """
     # Step 1: Analyze video for smoke union bbox
-    smoke_union_bbox, stats = analyze_video_for_smoke_bbox(video_path, model, conf_threshold)
+    smoke_union_bbox, stats = analyze_video_for_smoke_bbox(
+        video_path, model, conf_threshold, detect_mode=detect_mode
+    )
 
-    print(f"\nProcessing video with ROI extraction...")
-    if use_ema:
+    print(f"\nProcessing video with ROI extraction... (detect: {detect_mode})")
+    if use_ema and detect_mode != 'smoke':
         print(f"Fire mask EMA smoothing enabled (alpha={ema_alpha:.2f})")
     if augment:
         print(f"Data augmentation enabled (seed={augment_seed})")
@@ -346,7 +387,8 @@ def preprocess_video_for_lstm(
             break
 
         preprocessed, info = preprocess_frame(
-            frame, model, smoke_union_bbox, mask_ema, conf_threshold, augment_params
+            frame, model, smoke_union_bbox, mask_ema, conf_threshold, augment_params,
+            detect_mode=detect_mode
         )
 
         yield frame_idx, preprocessed, info
@@ -359,7 +401,8 @@ def validate_processing(
     video_path: str,
     model: YOLO,
     conf_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
-    window_name: str = "ROI Processing Validation"
+    window_name: str = "ROI Processing Validation",
+    detect_mode: DetectMode = 'all'
 ):
     """
     Validate ROI processing with side-by-side view.
@@ -371,7 +414,9 @@ def validate_processing(
     video_name = video_path.stem
 
     # First analyze video
-    smoke_union_bbox, stats = analyze_video_for_smoke_bbox(str(video_path), model, conf_threshold)
+    smoke_union_bbox, stats = analyze_video_for_smoke_bbox(
+        str(video_path), model, conf_threshold, detect_mode=detect_mode
+    )
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -380,7 +425,7 @@ def validate_processing(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
 
-    print(f"\nValidating: {video_name}")
+    print(f"\nValidating: {video_name} (detect: {detect_mode})")
     print(f"FPS: {fps:.2f}, Total frames: {total_frames}")
     print(f"\nControls:")
     print(f"  'q' or ESC: Stop playback")
@@ -408,36 +453,40 @@ def validate_processing(
             continue
 
         # Process frame
-        preprocessed, info = preprocess_frame(frame, model, smoke_union_bbox, mask_ema, conf_threshold)
+        preprocessed, info = preprocess_frame(
+            frame, model, smoke_union_bbox, mask_ema, conf_threshold,
+            detect_mode=detect_mode
+        )
 
         # Left panel: original with overlays
         resized_frame = cv2.resize(frame, INFERENCE_SIZE, interpolation=cv2.INTER_LINEAR)
         left_frame = resized_frame.copy()
 
-        # Draw smoke union bbox
-        if smoke_union_bbox is not None:
+        # Draw smoke union bbox (only if detecting smoke)
+        if smoke_union_bbox is not None and detect_mode != 'fire':
             x1, y1, x2, y2 = smoke_union_bbox
             cv2.rectangle(left_frame, (x1, y1), (x2, y2), CLASS_COLORS[2], 2)
             cv2.putText(left_frame, "smoke bbox", (x1, y1 - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, CLASS_COLORS[2], 2)
 
-        # Draw fire detections
-        results = model(resized_frame, conf=conf_threshold, verbose=False)[0]
-        h, w = resized_frame.shape[:2]
-        detections = extract_detections_from_yolo(results, (h, w), TARGET_CLASSES, conf_threshold)
+        # Draw fire detections (only if detecting fire)
+        if detect_mode != 'smoke':
+            results = model(resized_frame, conf=conf_threshold, verbose=False)[0]
+            h, w = resized_frame.shape[:2]
+            detections = extract_detections_from_yolo(results, (h, w), TARGET_CLASSES, conf_threshold)
 
-        for det in detections:
-            if det.class_id in SEGMENT_CLASSES:
-                # Fire: show mask contour
-                if det.mask is not None:
-                    contours, _ = cv2.findContours(
-                        det.mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                    )
-                    cv2.drawContours(left_frame, contours, -1, CLASS_COLORS[0], 2)
+            for det in detections:
+                if det.class_id in SEGMENT_CLASSES:
+                    # Fire: show mask contour
+                    if det.mask is not None:
+                        contours, _ = cv2.findContours(
+                            det.mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                        )
+                        cv2.drawContours(left_frame, contours, -1, CLASS_COLORS[0], 2)
 
-                x1, y1, x2, y2 = det.bbox
-                cv2.putText(left_frame, f"fire {det.confidence:.2f}", (x1, y1 - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, CLASS_COLORS[0], 2)
+                    x1, y1, x2, y2 = det.bbox
+                    cv2.putText(left_frame, f"fire {det.confidence:.2f}", (x1, y1 - 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, CLASS_COLORS[0], 2)
 
         # Right panel: preprocessed
         right_frame = preprocessed.copy()
@@ -504,6 +553,12 @@ Examples:
   # Preprocess video for LSTM training
   python video_roi_extractor.py --model best.pt --video input.mp4 --output ./output
 
+  # Detect only fire (ignore smoke)
+  python video_roi_extractor.py --model best.pt --video input.mp4 --output ./output --detect fire
+
+  # Detect only smoke (ignore fire)
+  python video_roi_extractor.py --model best.pt --video input.mp4 --output ./output --detect smoke
+
   # With data augmentation (single augmented dataset)
   python video_roi_extractor.py --model best.pt --video input.mp4 --output ./output --augment
 
@@ -517,6 +572,8 @@ Examples:
     parser.add_argument("--output", "-o", type=str, default=None, help="Output directory for preprocessed frames")
     parser.add_argument("--validate", action="store_true", help="Run validation mode (preview)")
     parser.add_argument("--conf", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD, help="Confidence threshold")
+    parser.add_argument("--detect", "-d", type=str, choices=['all', 'fire', 'smoke'], default='all',
+                       help="Detection mode: 'all' (default), 'fire' only, or 'smoke' only")
     parser.add_argument("--no-ema", action="store_true", help="Disable EMA smoothing for fire masks")
     parser.add_argument("--augment", "-a", action="store_true", help="Apply data augmentation to output frames")
     parser.add_argument("-n", "--num-datasets", type=int, default=1,
@@ -540,7 +597,7 @@ Examples:
     print()
 
     if args.validate or args.output is None:
-        validate_processing(str(video_path), model, args.conf)
+        validate_processing(str(video_path), model, args.conf, detect_mode=args.detect)
     else:
         output_path = Path(args.output).expanduser()
         video_name = video_path.stem
@@ -550,6 +607,7 @@ Examples:
 
         print(f"Preprocessing video: {video_name}")
         print(f"Output directory: {output_path}")
+        print(f"Detection mode: {args.detect}")
         if args.augment:
             print(f"Augmentation: ON (generating {num_datasets} dataset(s))")
         else:
@@ -584,7 +642,8 @@ Examples:
                 str(video_path), model, args.conf,
                 use_ema=not args.no_ema,
                 augment=args.augment,
-                augment_seed=augment_seed
+                augment_seed=augment_seed,
+                detect_mode=args.detect
             ):
                 frame_count += 1
 

@@ -2,18 +2,19 @@
 Data CSV Generator
 
 Scans directory structure to find image sequence folders and generates/updates
-data.csv with folder paths and their type (dynamic/static).
+data.csv with folder paths and their type (dynamic/static/negative).
 
-The script automatically determines whether a folder contains dynamic or static
-frames based on the parent folder name:
+The script automatically determines the folder type based on the parent folder name:
 - If parent contains "dynamic" -> type is "dynamic"
 - If parent contains "static" -> type is "static"
+- If parent contains "negative" -> type is "negative"
 - Otherwise -> asks user or skips
 
 Output format:
     folder_name,type
     fire_dynamic/11016-228113782_small,dynamic
     fire_static/image_001,static
+    negative_samples/person_001,negative
 """
 
 import csv
@@ -45,11 +46,12 @@ def has_image_files(directory: Path, extensions: List[str]) -> bool:
 
 def determine_type_from_path(folder_path: Path, root_path: Path) -> str:
     """
-    Determine if folder contains dynamic or static frames based on parent folder name.
+    Determine folder type based on parent folder name.
 
     Rules:
     - If any parent folder name contains "dynamic" -> "dynamic"
     - If any parent folder name contains "static" -> "static"
+    - If any parent folder name contains "negative" -> "negative"
     - Otherwise -> "unknown"
 
     Args:
@@ -57,7 +59,7 @@ def determine_type_from_path(folder_path: Path, root_path: Path) -> str:
         root_path: Root directory being scanned
 
     Returns:
-        "dynamic", "static", or "unknown"
+        "dynamic", "static", "negative", or "unknown"
     """
     # Get relative path from root
     try:
@@ -72,6 +74,8 @@ def determine_type_from_path(folder_path: Path, root_path: Path) -> str:
             return "dynamic"
         elif "static" in part_lower:
             return "static"
+        elif "negative" in part_lower:
+            return "negative"
 
     return "unknown"
 
@@ -93,7 +97,7 @@ def find_image_folders(
 
     Returns:
         List of tuples: [(relative_folder_path, type), ...]
-        where type is "dynamic" or "static"
+        where type is "dynamic", "static", or "negative"
     """
     if verbose:
         print(f"Scanning directory: {root_dir}")
@@ -267,17 +271,19 @@ def main():
         epilog="""
 Description:
   Scans directory structure to find image sequence folders and generates/updates
-  data.csv with folder paths and their type (dynamic/static).
+  data.csv with folder paths and their type (dynamic/static/negative).
 
   Type detection rules:
     - If parent folder contains "dynamic" -> type is "dynamic"
     - If parent folder contains "static" -> type is "static"
+    - If parent folder contains "negative" -> type is "negative"
     - Otherwise -> skipped (unknown type)
 
   Output CSV format:
     folder_name,type
     fire_dynamic/11016-228113782_small,dynamic
     fire_static/image_001,static
+    negative_samples/person_001,negative
 
 Examples:
   # Generate new data.csv from directory
