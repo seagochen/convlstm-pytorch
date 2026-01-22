@@ -1,10 +1,12 @@
 from .convlstm import ConvLSTM, ConvLSTMCell
-from .fire_convlstm import FireConvLSTM, create_model, heatmap_to_prob
+from .temporal_classifier import TemporalClassifier, FireConvLSTM, create_model, heatmap_to_prob, heatmap_to_pred
 
 __all__ = [
     'ConvLSTM',
     'ConvLSTMCell',
-    'FireConvLSTM',
+    'TemporalClassifier',
+    'FireConvLSTM',  # 向后兼容别名
     'create_model',
     'heatmap_to_prob',
+    'heatmap_to_pred',
 ]

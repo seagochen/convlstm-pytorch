@@ -1,17 +1,22 @@
-from .models import FireConvLSTM, ConvLSTM, ConvLSTMCell, create_model, heatmap_to_prob
+from .models import TemporalClassifier, FireConvLSTM, ConvLSTM, ConvLSTMCell, create_model, heatmap_to_prob, heatmap_to_pred
 from .training import Trainer
-from .utils import FireSequenceDataset, build_dataloader
+from .utils import SequenceDataset, FireSequenceDataset, build_dataloader, ClassConfig
 
 __all__ = [
     # Models
-    'FireConvLSTM',
+    'TemporalClassifier',
+    'FireConvLSTM',  # 向后兼容别名
     'ConvLSTM',
     'ConvLSTMCell',
     'create_model',
     'heatmap_to_prob',
+    'heatmap_to_pred',
     # Training
     'Trainer',
     # Data
-    'FireSequenceDataset',
+    'SequenceDataset',
+    'FireSequenceDataset',  # 向后兼容别名
     'build_dataloader',
+    # Classes
+    'ClassConfig',
 ]

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-FireConvLSTM 推理/检测脚本
+时序分类推理/检测脚本
+
+用于区分动态图像序列和静态图像序列
 
 Usage:
     # 检测单个视频文件夹
@@ -11,6 +13,9 @@ Usage:
 
     # 保存可视化结果
     python detect.py --source /path/to/frames --weights best_model.pth --save_viz --output ./results
+
+    # 使用自定义类别
+    python detect.py --source /path/to/frames --weights best_model.pth --classes static dynamic negative
 """
 
 import os
@@ -25,11 +30,11 @@ from typing import List, Tuple, Optional
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from convlstm import FireConvLSTM, create_model, heatmap_to_prob
+from convlstm import TemporalClassifier, create_model, heatmap_to_prob, heatmap_to_pred, ClassConfig
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Fire detection inference using FireConvLSTM')
+    parser = argparse.ArgumentParser(description='Temporal classification inference')
 
     parser.add_argument('--source', type=str, required=True,
                         help='输入源: 图片文件夹路径')
@@ -40,9 +45,14 @@ def parse_args():
     parser.add_argument('--target_size', type=int, nargs=2, default=[640, 640],
                         help='目标图像尺寸 (H, W)')
     parser.add_argument('--threshold', type=float, default=0.5,
-                        help='火灾检测阈值')
+                        help='分类阈值（仅用于二分类模式）')
     parser.add_argument('--device', type=str, default='auto',
                         help='推理设备 (cuda/cpu/auto)')
+
+    # 类别参数
+    parser.add_argument('--classes', type=str, nargs='+',
+                        default=['static', 'dynamic', 'negative'],
+                        help='类别列表，按标签顺序 (默认: static dynamic negative)')
 
     # 输出参数
     parser.add_argument('--output', type=str, default='./results',
@@ -95,6 +105,7 @@ def detect_folder(
     seq_length: int,
     target_size: Tuple[int, int],
     device: torch.device,
+    class_config: ClassConfig,
     threshold: float = 0.5
 ) -> dict:
     """
@@ -103,9 +114,10 @@ def detect_folder(
     Returns:
         {
             'folder': str,
-            'prediction': str,  # 'dynamic' or 'static'
-            'probability': float,
-            'heatmap': np.ndarray,  # (20, 20)
+            'prediction': str,  # 类别名称
+            'probability': float,  # 预测类别的概率
+            'all_probs': dict,  # 所有类别的概率
+            'heatmap': np.ndarray,  # (num_classes, 20, 20) or (20, 20) for binary
             'frames_used': List[str]
         }
     """
@@ -116,6 +128,7 @@ def detect_folder(
             'folder': folder_path.name,
             'prediction': 'error',
             'probability': 0.0,
+            'all_probs': {},
             'heatmap': None,
             'frames_used': [],
             'error': f'Not enough frames: {len(frames_list)} < {seq_length}'
@@ -134,16 +147,31 @@ def detect_folder(
     # 推理
     model.eval()
     with torch.no_grad():
-        heatmap = model(frames_tensor)  # (1, 1, 20, 20)
-        prob = heatmap_to_prob(heatmap).item()
+        heatmap = model(frames_tensor)  # (1, num_classes, 20, 20)
+        probs = heatmap_to_prob(heatmap)  # (1,) or (1, num_classes)
 
-    prediction = 'dynamic' if prob > threshold else 'static'
-    heatmap_np = heatmap[0, 0].cpu().numpy()
+    num_classes = class_config.num_classes
+
+    if num_classes == 1 or (hasattr(model, 'num_classes') and model.num_classes == 1):
+        # 二分类模式
+        prob = probs.item()
+        prediction = 'dynamic' if prob > threshold else 'static'
+        all_probs = {'static': 1 - prob, 'dynamic': prob}
+        heatmap_np = heatmap[0, 0].cpu().numpy()
+    else:
+        # 多分类模式
+        probs_np = probs[0].cpu().numpy()  # (num_classes,)
+        pred_idx = int(probs_np.argmax())
+        prediction = class_config.label_to_name(pred_idx)
+        prob = probs_np[pred_idx]
+        all_probs = {class_config.label_to_name(i): float(probs_np[i]) for i in range(num_classes)}
+        heatmap_np = heatmap[0].cpu().numpy()  # (num_classes, 20, 20)
 
     return {
         'folder': folder_path.name,
         'prediction': prediction,
-        'probability': prob,
+        'probability': float(prob),
+        'all_probs': all_probs,
         'heatmap': heatmap_np,
         'frames_used': [frames_list[start_idx + i].name for i in range(seq_length)]
     }
@@ -153,7 +181,8 @@ def visualize_result(
     result: dict,
     folder_path: Path,
     target_size: Tuple[int, int],
-    output_path: Path
+    output_path: Path,
+    class_config: ClassConfig
 ):
     """可视化检测结果"""
     import matplotlib.pyplot as plt
@@ -170,8 +199,12 @@ def visualize_result(
     if last_frame.shape[:2] != target_size:
         last_frame = cv2.resize(last_frame, (target_size[1], target_size[0]))
 
-    # 上采样热力图
+    # 处理热力图
     heatmap = result['heatmap']
+    if heatmap.ndim == 3:
+        # 多分类：取预测类别的热力图
+        pred_idx = class_config.name_to_label(result['prediction'])
+        heatmap = heatmap[pred_idx]
     heatmap_resized = cv2.resize(heatmap, (target_size[1], target_size[0]))
 
     # 创建可视化
@@ -216,12 +249,17 @@ def main():
     else:
         device = torch.device(args.device)
 
+    # 创建类别配置
+    class_config = ClassConfig(args.classes)
+    num_classes = class_config.num_classes
+
     print(f"Device: {device}")
     print(f"Model: {args.weights}")
+    print(f"Classes: {class_config.class_names} ({num_classes} classes)")
 
     # 加载模型
     print("\n加载模型...")
-    model = create_model(args.weights)
+    model = create_model(args.weights, num_classes=num_classes)
     model = model.to(device)
     model.eval()
 
@@ -252,6 +290,7 @@ def main():
             seq_length=args.seq_length,
             target_size=target_size,
             device=device,
+            class_config=class_config,
             threshold=args.threshold
         )
         results.append(result)
@@ -260,27 +299,39 @@ def main():
         if 'error' in result:
             print(f"[ERROR] {result['folder']}: {result['error']}")
         else:
-            status = '🔥' if result['prediction'] == 'dynamic' else '✓'
-            print(f"[{status}] {result['folder']}: {result['prediction'].upper()} "
-                  f"(prob={result['probability']:.3f})")
+            # 根据预测类别选择状态图标
+            if result['prediction'] == 'dynamic':
+                status = '[D]'
+            elif result['prediction'] == 'negative':
+                status = '[N]'
+            else:
+                status = '[S]'
+
+            # 显示所有类别的概率
+            probs_str = ", ".join([f"{k}={v:.3f}" for k, v in result['all_probs'].items()])
+            print(f"{status} {result['folder']}: {result['prediction'].upper()} ({probs_str})")
 
         # 保存可视化
         if args.save_viz and result['heatmap'] is not None:
             output_path = Path(args.output) / f"{result['folder']}_result.png"
-            visualize_result(result, folder, target_size, output_path)
+            visualize_result(result, folder, target_size, output_path, class_config)
 
     # 统计
     print("-" * 60)
     print("\n检测统计:")
 
     valid_results = [r for r in results if 'error' not in r]
-    dynamic_count = sum(1 for r in valid_results if r['prediction'] == 'dynamic')
-    static_count = len(valid_results) - dynamic_count
+
+    # 按类别统计
+    class_counts = class_config.get_statistics_template()
+    for r in valid_results:
+        if r['prediction'] in class_counts:
+            class_counts[r['prediction']] += 1
 
     print(f"  总计: {len(results)} 个文件夹")
     print(f"  成功: {len(valid_results)}")
-    print(f"  Dynamic (真火): {dynamic_count}")
-    print(f"  Static (假火): {static_count}")
+    for class_name, count in class_counts.items():
+        print(f"  {class_name}: {count}")
 
     if args.save_viz:
         print(f"\n可视化结果已保存到: {args.output}")

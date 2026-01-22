@@ -1,27 +1,33 @@
 """
-火灾检测训练器
+时序分类训练器
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import csv
+import cv2
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from tqdm import tqdm
+from datetime import datetime
 
-from ..models import FireConvLSTM, heatmap_to_prob
+from ..models import TemporalClassifier, heatmap_to_prob, heatmap_to_pred
 
 
 class Trainer:
     """
-    FireConvLSTM 训练器
+    TemporalClassifier 训练器
+
+    用于训练时序分类模型，区分动态和静态图像序列
 
     Args:
-        model: FireConvLSTM 模型
+        model: TemporalClassifier 模型
         device: 训练设备
         learning_rate: 学习率
         weight_decay: 权重衰减
+        class_config: 类别配置（用于多分类）
     """
 
     def __init__(
@@ -30,14 +36,29 @@ class Trainer:
         device: str = 'cuda',
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-5,
+        class_config = None,
     ):
+        # 延迟导入以避免循环依赖
+        from ..utils.classes import ClassConfig
+
         self.model = model.to(device)
         self.device = torch.device(device)
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
 
-        # 损失函数
-        self.criterion = nn.BCELoss()
+        # 类别配置
+        self.class_config = class_config or ClassConfig.default()
+        self.num_classes = self.class_config.num_classes
+
+        # 损失函数：根据类别数选择
+        if self.num_classes == 1 or (hasattr(model, 'num_classes') and model.num_classes == 1):
+            # 二分类模式
+            self.criterion = nn.BCELoss()
+            self._is_binary = True
+        else:
+            # 多分类模式
+            self.criterion = nn.CrossEntropyLoss()
+            self._is_binary = False
 
         # 优化器
         self.optimizer = optim.Adam(
@@ -83,16 +104,22 @@ class Trainer:
         pbar = tqdm(dataloader, desc="Training")
         for frames, labels in pbar:
             frames = frames.to(self.device)  # (B, T, 3, 640, 640)
-            labels = labels.float().to(self.device)  # (B,)
+            labels = labels.to(self.device)  # (B,)
 
             self.optimizer.zero_grad()
 
             # Forward
-            heatmap = self.model(frames)  # (B, 1, 20, 20)
-            probs = heatmap_to_prob(heatmap)  # (B,)
+            heatmap = self.model(frames)  # (B, num_classes, 20, 20)
+            probs = heatmap_to_prob(heatmap)  # (B,) or (B, num_classes)
 
             # Loss
-            loss = self.criterion(probs, labels)
+            if self._is_binary:
+                loss = self.criterion(probs, labels.float())
+                preds = (probs > 0.5).long()
+            else:
+                # 多分类: CrossEntropyLoss 需要 (B, C) 和 (B,) 长整型标签
+                loss = self.criterion(probs, labels.long())
+                preds = probs.argmax(dim=1)
 
             # Backward
             loss.backward()
@@ -100,7 +127,6 @@ class Trainer:
 
             # Statistics
             total_loss += loss.item() * frames.size(0)
-            preds = (probs > 0.5).float()
             correct += (preds == labels).sum().item()
             total += frames.size(0)
 
@@ -117,34 +143,293 @@ class Trainer:
             dataloader: 验证数据加载器
 
         Returns:
-            (avg_loss, accuracy, all_probs, all_labels)
+            (avg_loss, accuracy, all_preds, all_labels)
         """
         self.model.eval()
         total_loss = 0
         correct = 0
         total = 0
 
-        all_probs = []
+        all_preds = []
         all_labels = []
 
         for frames, labels in tqdm(dataloader, desc="Validating"):
             frames = frames.to(self.device)
-            labels = labels.float().to(self.device)
+            labels = labels.to(self.device)
 
             heatmap = self.model(frames)
             probs = heatmap_to_prob(heatmap)
 
-            loss = self.criterion(probs, labels)
+            if self._is_binary:
+                loss = self.criterion(probs, labels.float())
+                preds = (probs > 0.5).long()
+            else:
+                loss = self.criterion(probs, labels.long())
+                preds = probs.argmax(dim=1)
 
             total_loss += loss.item() * frames.size(0)
-            preds = (probs > 0.5).float()
             correct += (preds == labels).sum().item()
             total += frames.size(0)
 
-            all_probs.extend(probs.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
-        return total_loss / total, correct / total, np.array(all_probs), np.array(all_labels)
+        return total_loss / total, correct / total, np.array(all_preds), np.array(all_labels)
+
+    @torch.no_grad()
+    def generate_detection_report(
+        self,
+        dataloader,
+        report_dir: Path,
+        epoch: int,
+        num_samples: int = 10
+    ):
+        """
+        生成检测报告
+
+        Args:
+            dataloader: 数据加载器
+            report_dir: 报告保存目录
+            epoch: 当前轮数
+            num_samples: 抽样数量 (每类各取一半)
+        """
+        self.model.eval()
+
+        # 创建报告目录
+        report_dir = Path(report_dir)
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        # 创建本次报告的子目录
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        epoch_report_dir = report_dir / f"epoch_{epoch:03d}_{timestamp}"
+        epoch_report_dir.mkdir(parents=True, exist_ok=True)
+        heatmap_dir = epoch_report_dir / "heatmaps"
+        heatmap_dir.mkdir(parents=True, exist_ok=True)
+
+        # 第一遍：收集所有样本的预测结果（不保存图像和热力图）
+        all_sample_metadata = []
+
+        for batch_idx, (frames, labels) in enumerate(tqdm(dataloader, desc=f"Collecting predictions for epoch {epoch}")):
+            frames = frames.to(self.device)
+            labels = labels.to(self.device)
+
+            heatmaps = self.model(frames)  # (B, num_classes, 20, 20)
+            probs = heatmap_to_prob(heatmaps)  # (B,) or (B, num_classes)
+
+            if self._is_binary:
+                preds = (probs > 0.5).long()
+            else:
+                preds = probs.argmax(dim=1)
+
+            # 只保存元数据，不保存图像
+            for i in range(frames.size(0)):
+                sample_idx = batch_idx * dataloader.batch_size + i
+
+                # 获取样本详细信息
+                dataset = dataloader.dataset
+                if hasattr(dataset, 'dataset'):  # 处理 Subset
+                    actual_idx = dataset.indices[sample_idx]
+                    base_dataset = dataset.dataset
+                else:
+                    actual_idx = sample_idx
+                    base_dataset = dataset
+
+                sample_info = base_dataset.get_sample_info(actual_idx)
+
+                # 获取概率值
+                if self._is_binary:
+                    pred_prob = probs[i].item()
+                    pred_probs_str = f"{pred_prob:.4f}"
+                else:
+                    pred_prob = probs[i, preds[i]].item()
+                    pred_probs_str = ", ".join([f"{p:.4f}" for p in probs[i].cpu().numpy()])
+
+                true_label = int(labels[i].item())
+                pred_label = int(preds[i].item())
+
+                all_sample_metadata.append({
+                    'sample_idx': sample_idx,
+                    'actual_idx': actual_idx,
+                    'folder': sample_info['folder'],
+                    'frame_files': ', '.join(sample_info['frame_files']),
+                    'true_label': true_label,
+                    'true_label_name': self.class_config.label_to_name(true_label),
+                    'pred_prob': pred_prob,
+                    'pred_probs_str': pred_probs_str,
+                    'pred_label': pred_label,
+                    'pred_label_name': self.class_config.label_to_name(pred_label),
+                    'correct': (pred_label == true_label),
+                })
+
+        # 分类抽样：按类别分组
+        class_metadata = {name: [] for name in self.class_config.class_names}
+        for s in all_sample_metadata:
+            class_name = s['true_label_name']
+            if class_name in class_metadata:
+                class_metadata[class_name].append(s)
+
+        samples_per_class = max(1, num_samples // self.num_classes)
+
+        # 随机抽样
+        import random
+        random.seed(epoch)
+
+        selected_metadata = []
+        selected_per_class = {}
+        for class_name, metadata_list in class_metadata.items():
+            selected = random.sample(metadata_list, min(samples_per_class, len(metadata_list)))
+            selected_metadata.extend(selected)
+            selected_per_class[class_name] = len(selected)
+
+        # 第二遍：只对选中的样本加载图像和生成热力图
+        print(f"\nLoading images for {len(selected_metadata)} selected samples...")
+        selected_samples = []
+
+        # 获取数据集引用
+        dataset = dataloader.dataset
+        if hasattr(dataset, 'dataset'):
+            base_dataset = dataset.dataset
+        else:
+            base_dataset = dataset
+
+        for meta in tqdm(selected_metadata, desc="Loading selected samples"):
+            # 重新加载选中的样本
+            frames, label = base_dataset[meta['actual_idx']]
+            frames = frames.unsqueeze(0).to(self.device)  # (1, T, 3, H, W)
+
+            # 生成热力图
+            with torch.no_grad():
+                heatmap = self.model(frames)  # (1, 1, 20, 20)
+
+            selected_samples.append({
+                **meta,
+                'frames': frames.squeeze(0).cpu(),  # (T, 3, H, W)
+                'heatmap': heatmap.squeeze(0).cpu()  # (1, 20, 20)
+            })
+
+        # 保存 CSV 报告
+        csv_path = epoch_report_dir / f"detection_report_epoch_{epoch:03d}.csv"
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'Sample_Index', 'Folder', 'Frame_Files',
+                'True_Label', 'True_Label_Name',
+                'Pred_Probability', 'Pred_Label', 'Pred_Label_Name',
+                'Correct', 'Heatmap_File'
+            ])
+
+            for sample in selected_samples:
+                # 保存热力图
+                heatmap_file = f"heatmap_sample_{sample['sample_idx']:04d}.png"
+                self._save_heatmap_visualization(
+                    sample['frames'],
+                    sample['heatmap'],
+                    heatmap_dir / heatmap_file,
+                    sample['true_label_name'],
+                    sample['pred_label_name'],
+                    sample['pred_prob']
+                )
+
+                writer.writerow([
+                    sample['sample_idx'],
+                    sample['folder'],
+                    sample['frame_files'],
+                    int(sample['true_label']),
+                    sample['true_label_name'],
+                    f"{sample['pred_prob']:.4f}",
+                    int(sample['pred_label']),
+                    sample['pred_label_name'],
+                    'Yes' if sample['correct'] else 'No',
+                    heatmap_file
+                ])
+
+        # 计算并保存准确率统计
+        total_correct = sum(s['correct'] for s in all_sample_metadata)
+        total_samples = len(all_sample_metadata)
+        accuracy = total_correct / total_samples if total_samples > 0 else 0
+
+        stats_path = epoch_report_dir / f"statistics_epoch_{epoch:03d}.txt"
+        with open(stats_path, 'w', encoding='utf-8') as f:
+            f.write(f"Epoch {epoch} Detection Report\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Timestamp: {timestamp}\n")
+            f.write(f"Total Samples: {total_samples}\n")
+            f.write(f"Correct Predictions: {total_correct}\n")
+            f.write(f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)\n\n")
+            f.write(f"Classes: {self.class_config.class_names}\n")
+            f.write(f"Samples per class:\n")
+            for class_name in self.class_config.class_names:
+                count = len(class_metadata.get(class_name, []))
+                f.write(f"  - {class_name}: {count}\n")
+            f.write(f"\nSelected Samples for Report: {len(selected_samples)}\n")
+            for class_name, count in selected_per_class.items():
+                f.write(f"  - {class_name}: {count}\n")
+            f.write(f"\nReport saved to: {epoch_report_dir}\n")
+            f.write(f"CSV file: {csv_path.name}\n")
+            f.write(f"Heatmaps saved in: {heatmap_dir.name}/\n")
+
+        print(f"\n{'='*60}")
+        print(f"Detection Report Generated for Epoch {epoch}")
+        print(f"{'='*60}")
+        print(f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+        print(f"Total Samples: {total_samples}")
+        print(f"Report saved to: {epoch_report_dir}")
+        print(f"{'='*60}\n")
+
+        return accuracy
+
+    def _save_heatmap_visualization(
+        self,
+        frames: torch.Tensor,
+        heatmap: torch.Tensor,
+        save_path: Path,
+        true_label: str,
+        pred_label: str,
+        pred_prob: float
+    ):
+        """
+        保存热力图可视化
+
+        Args:
+            frames: (T, 3, H, W) 输入帧序列
+            heatmap: (num_classes, H_heat, W_heat) 热力图
+            save_path: 保存路径
+            true_label: 真实标签名称
+            pred_label: 预测标签名称
+            pred_prob: 预测概率
+        """
+        # 取最后一帧作为背景
+        last_frame = frames[-1].permute(1, 2, 0).numpy()  # (H, W, 3)
+        last_frame = (last_frame * 255).astype(np.uint8)
+
+        # 热力图处理
+        # 对于多分类，取预测类别的热力图；对于二分类，取唯一的热力图
+        if heatmap.shape[0] == 1:
+            heatmap_np = heatmap.squeeze(0).numpy()  # (H_heat, W_heat)
+        else:
+            # 多分类：取预测类别对应的热力图通道
+            pred_label_idx = self.class_config.name_to_label(pred_label)
+            heatmap_np = heatmap[pred_label_idx].numpy()  # (H_heat, W_heat)
+        heatmap_resized = cv2.resize(heatmap_np, (last_frame.shape[1], last_frame.shape[0]))
+
+        # 归一化到 [0, 255]
+        heatmap_resized = (heatmap_resized * 255).astype(np.uint8)
+
+        # 应用颜色映射
+        heatmap_colored = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
+
+        # 叠加到原图
+        overlay = cv2.addWeighted(last_frame, 0.6, heatmap_colored, 0.4, 0)
+
+        # 添加文本信息
+        color = (0, 255, 0) if pred_label == true_label else (0, 0, 255)
+        cv2.putText(overlay, f"True: {true_label}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(overlay, f"Pred: {pred_label} ({pred_prob:.3f})", (10, 70),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+
+        # 保存
+        cv2.imwrite(str(save_path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
 
     def fit(
         self,
@@ -152,7 +437,11 @@ class Trainer:
         val_loader,
         num_epochs: int = 10,
         save_dir: str = './checkpoints',
-        save_best_only: bool = True
+        save_best_only: bool = True,
+        report_interval: int = 5,
+        report_dir: str = './reports',
+        report_samples: int = 10,
+        start_epoch: int = 0
     ) -> Dict:
         """
         完整训练流程
@@ -163,6 +452,10 @@ class Trainer:
             num_epochs: 训练轮数
             save_dir: 模型保存目录
             save_best_only: 是否只保存最佳模型
+            report_interval: 每隔多少轮生成一次检测报告 (0 表示不生成)
+            report_dir: 报告保存目录
+            report_samples: 每次报告抽样的样本数量
+            start_epoch: 起始 epoch（用于恢复训练）
 
         Returns:
             训练历史
@@ -171,10 +464,13 @@ class Trainer:
         save_dir.mkdir(parents=True, exist_ok=True)
 
         print("=" * 60)
-        print("开始训练")
+        if start_epoch > 0:
+            print(f"从 Epoch {start_epoch + 1} 恢复训练")
+        else:
+            print("开始训练")
         print("=" * 60)
 
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
             print("-" * 40)
 
@@ -203,15 +499,23 @@ class Trainer:
                 self.best_val_acc = val_acc
                 self.best_epoch = epoch + 1
 
-            if is_best or not save_best_only:
-                self.save_checkpoint(
-                    save_dir / f'checkpoint_epoch_{epoch + 1}.pth',
-                    epoch + 1,
-                    val_acc
+            # 始终保存最新模型
+            self.save_checkpoint(save_dir / 'last.pth', epoch + 1, val_acc)
+
+            # 如果是最佳模型，额外保存为 best.pth
+            if is_best:
+                self.save_checkpoint(save_dir / 'best.pth', epoch + 1, val_acc)
+                print(f"  ★ 新最佳模型! Val Acc: {val_acc:.4f}")
+
+            # 生成检测报告
+            if report_interval > 0 and (epoch + 1) % report_interval == 0:
+                print(f"\n生成第 {epoch + 1} 轮检测报告...")
+                self.generate_detection_report(
+                    dataloader=val_loader,
+                    report_dir=Path(report_dir),
+                    epoch=epoch + 1,
+                    num_samples=report_samples
                 )
-                if is_best:
-                    self.save_checkpoint(save_dir / 'best_model.pth', epoch + 1, val_acc)
-                    print(f"  ★ 新最佳模型! Val Acc: {val_acc:.4f}")
 
         print("\n" + "=" * 60)
         print(f"训练完成! 最佳验证准确率: {self.best_val_acc:.4f} (Epoch {self.best_epoch})")
