@@ -14,7 +14,7 @@ class TemporalClassifier(nn.Module):
     输入: (Batch, Time, 3, 640, 640) - 连续 T 帧 RGB 图像
     输出:
         - num_classes=1: (Batch, 1, 20, 20) - 二分类概率热力图，值域 [0, 1]
-        - num_classes>1: (Batch, num_classes, 20, 20) - 多分类概率热力图，每个位置的通道和为 1
+        - num_classes>1: (Batch, num_classes, 20, 20) - 多分类 logits（原始输出，未经 softmax）
 
     热力图每个格子对应原图 32x32 像素区域
     热力图坐标 (i,j) → 原图区域 (i*32 : i*32+32, j*32 : j*32+32)
@@ -91,13 +91,13 @@ class TemporalClassifier(nn.Module):
 
         # Step 5: 应用激活函数
         if self.num_classes == 1:
-            # 二分类模式: 使用 Sigmoid
+            # 二分类模式: 使用 Sigmoid (BCELoss 需要概率输入)
             return torch.sigmoid(result_map)
             # output: (B, 1, 20, 20), 值域 [0, 1]
         else:
-            # 多分类模式: 使用 Softmax (在 channel 维度)
-            return F.softmax(result_map, dim=1)
-            # output: (B, num_classes, 20, 20), 每个位置的通道和为 1
+            # 多分类模式: 返回 logits (CrossEntropyLoss 内部会处理 softmax)
+            return result_map
+            # output: (B, num_classes, 20, 20), 原始 logits
 
 
 def create_model(checkpoint_path: str = None, num_classes: int = 3):
@@ -125,18 +125,18 @@ def create_model(checkpoint_path: str = None, num_classes: int = 3):
 
 def heatmap_to_prob(heatmap: torch.Tensor) -> torch.Tensor:
     """
-    将热力图转换为分类概率
+    将热力图转换为分类分数
 
     Args:
         heatmap: 热力图张量
-                 - 二分类: (B, 1, 20, 20)
-                 - 多分类: (B, num_classes, 20, 20)
+                 - 二分类: (B, 1, 20, 20) 概率值
+                 - 多分类: (B, num_classes, 20, 20) logits
 
     Returns:
         - 二分类: (B,) 正类概率值
-        - 多分类: (B, num_classes) 每个类别的概率值
+        - 多分类: (B, num_classes) 每个类别的 logits（用于 CrossEntropyLoss）
 
-    策略: 取热力图每个通道的最大值作为该类别的分类概率
+    策略: 取热力图每个通道的空间最大值
     """
     # heatmap: (B, C, H, W)
     # 对每个通道取空间最大值
