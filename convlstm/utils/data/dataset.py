@@ -139,9 +139,19 @@ class SequenceDataset(Dataset):
             num_frames = len(frames)
 
             if num_frames < self.seq_length:
-                print(f"Warning: folder {folder_name} has only {num_frames} frames, "
-                      f"need at least {self.seq_length}")
-                continue
+                missing = self.seq_length - num_frames
+                if missing > 1 or num_frames == 0:
+                    # 差超过1帧或无帧，跳过
+                    print(f"Warning: folder {folder_name} has only {num_frames} frames, "
+                          f"need at least {self.seq_length}, skipping")
+                    continue
+                # 只差1帧，复制最后一帧填充
+                print(f"Info: folder {folder_name} has {num_frames} frames, "
+                      f"padding 1 frame to reach {self.seq_length}")
+                frames = list(frames)  # 避免修改原列表
+                frames.append(frames[-1])
+                self.folder_frames[folder_path] = frames
+                num_frames = len(frames)
 
             # 滑动窗口生成样本
             # 样本数 = (num_frames - seq_length) // stride + 1
